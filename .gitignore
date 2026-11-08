@@ -1,0 +1,29 @@
+# Environment secrets
+.env
+.env.*
+
+# Python virtual environments
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Uploaded documents
+backend/storage/
+
+# Testing and cache
+.pytest_cache/
+.coverage
+
+# System files
+.DS_Store
+Thumbs.db
+# Local database backup
+backend/database_backup.py
