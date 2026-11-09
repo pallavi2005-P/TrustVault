@@ -5,6 +5,7 @@ import io
 
 from pathlib import Path
 from datetime import datetime
+from typing import Literal
 
 from fastapi import (
     APIRouter,
@@ -13,12 +14,13 @@ from fastapi import (
     UploadFile,
     File,
     Form,
+    Query,
     status
 )
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, EmailStr
+from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_
+from sqlalchemy import func
 
 from database import get_db
 from models import User, Document, DocumentShare, AuditLog
@@ -30,34 +32,23 @@ router = APIRouter(
     tags=["Document Management"]
 )
 
-# Secure local storage
 STORAGE_DIR = Path(__file__).resolve().parent / "storage" / "documents"
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-
+MAX_FILE_SIZE = 10 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".pdf", ".docx"}
 
 
-# Document response schema
-class DocumentResponse(BaseModel):
-    id: int
-    title: str
-    description: str | None
-    owner_id: int
-    uploaded_at: datetime
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-# Document sharing request schema
 class ShareRequest(BaseModel):
     recipient_email: EmailStr
 
 
-# Validate uploaded files
-def validate_file(filename: str, content: bytes):
+class FrontendShareRequest(BaseModel):
+    recipient_id: int
+    permission: Literal["read"] = "read"
 
+
+def validate_file(filename: str, content: bytes):
     extension = Path(filename).suffix.lower()
 
     if extension not in ALLOWED_EXTENSIONS:
@@ -94,14 +85,58 @@ def validate_file(filename: str, content: bytes):
             )
 
 
-# Check whether the current user can access a document
+def get_file_size(document: Document) -> int:
+    file_path = Path(document.file_path)
+
+    if file_path.is_file():
+        return file_path.stat().st_size
+
+    return 0
+
+
+def get_owner_summary(owner: User) -> dict:
+    return {
+        "id": str(owner.id),
+        "full_name": owner.username,
+        "email": owner.email
+    }
+
+
+def get_document_response(
+    document: Document,
+    db: Session,
+    shared_at=None
+) -> dict:
+
+    share_count = db.query(func.count(DocumentShare.id)).filter(
+        DocumentShare.document_id == document.id
+    ).scalar() or 0
+
+    response = {
+        "id": str(document.id),
+        "name": document.title,
+        "file_type": Path(document.title).suffix.lower().replace(".", ""),
+        "size_bytes": get_file_size(document),
+        "uploaded_at": document.uploaded_at,
+        "owner": get_owner_summary(document.owner),
+        "folder": None,
+        "share_count": share_count,
+        "description": document.description
+    }
+
+    if shared_at is not None:
+        response["shared_at"] = shared_at
+        response["permission"] = "read"
+
+    return response
+
+
 def get_accessible_document(
     document_id: int,
     current_user: User,
     db: Session
 ):
 
-    # First check whether the user owns the document
     document = db.query(Document).filter(
         Document.id == document_id,
         Document.owner_id == current_user.id
@@ -110,7 +145,6 @@ def get_accessible_document(
     if document:
         return document
 
-    # Otherwise check whether the document was shared with the user
     share = db.query(DocumentShare).filter(
         DocumentShare.document_id == document_id,
         DocumentShare.shared_with_user_id == current_user.id,
@@ -136,14 +170,106 @@ def get_accessible_document(
     return document
 
 
+def create_share(
+    document: Document,
+    recipient: User,
+    current_user: User,
+    db: Session
+):
+
+    if recipient.id == current_user.id:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot share a document with yourself"
+        )
+
+    if not recipient.is_active:
+        raise HTTPException(
+            status_code=404,
+            detail="Recipient is not an active user"
+        )
+
+    existing_share = db.query(DocumentShare).filter(
+        DocumentShare.document_id == document.id,
+        DocumentShare.shared_with_user_id == recipient.id
+    ).first()
+
+    if existing_share:
+        raise HTTPException(
+            status_code=409,
+            detail="Document is already shared with this user"
+        )
+
+    new_share = DocumentShare(
+        document_id=document.id,
+        shared_with_user_id=recipient.id,
+        permission="view"
+    )
+
+    db.add(new_share)
+    db.flush()
+
+    db.add(AuditLog(
+        user_id=current_user.id,
+        document_id=document.id,
+        action="DOCUMENT_SHARED",
+        details={
+            "recipient_email": recipient.email,
+            "permission": "read"
+        }
+    ))
+
+    db.commit()
+    db.refresh(new_share)
+
+    return {
+        "id": str(new_share.id),
+        "document_id": str(document.id),
+        "recipient": get_owner_summary(recipient),
+        "permission": "read",
+        "created_at": new_share.shared_at
+    }
+
+
+# LIST DOCUMENTS
+@router.get("/")
+def get_documents(
+    search: str | None = None,
+    folder: str | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+
+    query = db.query(Document).filter(
+        Document.owner_id == current_user.id
+    )
+
+    if search:
+        query = query.filter(
+            Document.title.ilike(f"%{search.strip()}%")
+        )
+
+    # Folder metadata is not stored in the current database model.
+    # The parameter is accepted for frontend compatibility.
+
+    documents = query.order_by(
+        Document.uploaded_at.desc()
+    ).all()
+
+    return [
+        get_document_response(document, db)
+        for document in documents
+    ]
+
+
 # UPLOAD DOCUMENT
 @router.post(
     "/upload",
-    response_model=DocumentResponse,
     status_code=status.HTTP_201_CREATED
 )
 async def upload_document(
     file: UploadFile = File(...),
+    folder: str | None = Form(None),
     description: str | None = Form(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -174,8 +300,6 @@ async def upload_document(
     validate_file(original_filename, content)
 
     extension = Path(original_filename).suffix.lower()
-
-    # Generate a unique server-side filename
     stored_filename = f"{uuid.uuid4().hex}{extension}"
     file_path = STORAGE_DIR / stored_filename
 
@@ -193,8 +317,7 @@ async def upload_document(
         db.add(new_document)
         db.flush()
 
-        # Record upload activity
-        audit = AuditLog(
+        db.add(AuditLog(
             user_id=current_user.id,
             document_id=new_document.id,
             action="DOCUMENT_UPLOADED",
@@ -202,13 +325,12 @@ async def upload_document(
                 "filename": original_filename,
                 "size_bytes": len(content)
             }
-        )
+        ))
 
-        db.add(audit)
         db.commit()
         db.refresh(new_document)
 
-        return new_document
+        return get_document_response(new_document, db)
 
     except Exception:
         db.rollback()
@@ -222,33 +344,67 @@ async def upload_document(
         await file.close()
 
 
-# LIST MY DOCUMENTS
-@router.get(
-    "/my",
-    response_model=list[DocumentResponse]
-)
+# KEEP THE OLDER /my ENDPOINT
+@router.get("/my")
 def get_my_documents(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
 
-    return db.query(Document).filter(
+    documents = db.query(Document).filter(
         Document.owner_id == current_user.id
     ).order_by(
         Document.uploaded_at.desc()
     ).all()
 
+    return [
+        get_document_response(document, db)
+        for document in documents
+    ]
 
-# SHARE DOCUMENT WITH A REGISTERED USER
-@router.post("/{document_id}/share")
-def share_document(
-    document_id: int,
-    request: ShareRequest,
+
+# LIST DOCUMENTS SHARED WITH ME
+@router.get("/shared-with-me")
+def get_shared_documents(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
 
-    # Only the document owner can share it
+    shares = db.query(DocumentShare).filter(
+        DocumentShare.shared_with_user_id == current_user.id,
+        DocumentShare.permission == "view"
+    ).order_by(
+        DocumentShare.shared_at.desc()
+    ).all()
+
+    results = []
+
+    for share in shares:
+        document = db.query(Document).filter(
+            Document.id == share.document_id
+        ).first()
+
+        if document:
+            results.append(
+                get_document_response(
+                    document,
+                    db,
+                    shared_at=share.shared_at
+                )
+            )
+
+    return results
+
+
+# SHARE DOCUMENT USING RECIPIENT ID
+@router.post("/{document_id}/shares")
+def share_document_by_id(
+    document_id: int,
+    request: FrontendShareRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+
     document = db.query(Document).filter(
         Document.id == document_id,
         Document.owner_id == current_user.id
@@ -260,7 +416,138 @@ def share_document(
             detail="Document not found or you are not the owner"
         )
 
-    # Find the registered recipient
+    recipient = db.query(User).filter(
+        User.id == request.recipient_id,
+        User.is_active.is_(True)
+    ).first()
+
+    if not recipient:
+        raise HTTPException(
+            status_code=404,
+            detail="Recipient is not a registered active user"
+        )
+
+    try:
+        return create_share(
+            document,
+            recipient,
+            current_user,
+            db
+        )
+
+    except Exception:
+        db.rollback()
+        raise
+
+
+# LIST SHARES FOR A DOCUMENT
+@router.get("/{document_id}/shares")
+def get_document_shares(
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+
+    document = db.query(Document).filter(
+        Document.id == document_id,
+        Document.owner_id == current_user.id
+    ).first()
+
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found or you are not the owner"
+        )
+
+    shares = db.query(DocumentShare).filter(
+        DocumentShare.document_id == document_id
+    ).all()
+
+    results = []
+
+    for share in shares:
+        recipient = db.query(User).filter(
+            User.id == share.shared_with_user_id
+        ).first()
+
+        if recipient:
+            results.append({
+                "id": str(share.id),
+                "document_id": str(document.id),
+                "recipient": get_owner_summary(recipient),
+                "permission": "read",
+                "created_at": share.shared_at
+            })
+
+    return results
+
+
+# REVOKE DOCUMENT ACCESS
+@router.delete("/{document_id}/shares/{share_id}")
+def revoke_document_share(
+    document_id: int,
+    share_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+
+    document = db.query(Document).filter(
+        Document.id == document_id,
+        Document.owner_id == current_user.id
+    ).first()
+
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found or you are not the owner"
+        )
+
+    share = db.query(DocumentShare).filter(
+        DocumentShare.id == share_id,
+        DocumentShare.document_id == document_id
+    ).first()
+
+    if not share:
+        raise HTTPException(
+            status_code=404,
+            detail="Share record not found"
+        )
+
+    db.add(AuditLog(
+        user_id=current_user.id,
+        document_id=document.id,
+        action="DOCUMENT_REVOKED",
+        details={
+            "shared_with_user_id": share.shared_with_user_id
+        }
+    ))
+
+    db.delete(share)
+    db.commit()
+
+    return {"message": "Document access revoked successfully"}
+
+
+# KEEP THE OLDER EMAIL-BASED SHARE ENDPOINT
+@router.post("/{document_id}/share")
+def share_document_by_email(
+    document_id: int,
+    request: ShareRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+
+    document = db.query(Document).filter(
+        Document.id == document_id,
+        Document.owner_id == current_user.id
+    ).first()
+
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found or you are not the owner"
+        )
+
     recipient_email = str(request.recipient_email).strip().lower()
 
     recipient = db.query(User).filter(
@@ -274,57 +561,20 @@ def share_document(
             detail="Recipient is not a registered active user"
         )
 
-    # Prevent sharing with yourself
-    if recipient.id == current_user.id:
-        raise HTTPException(
-            status_code=400,
-            detail="You cannot share a document with yourself"
-        )
-
-    # Check whether the document is already shared
-    existing_share = db.query(DocumentShare).filter(
-        DocumentShare.document_id == document.id,
-        DocumentShare.shared_with_user_id == recipient.id
-    ).first()
-
-    if existing_share:
-        raise HTTPException(
-            status_code=409,
-            detail="Document is already shared with this user"
-        )
-
     try:
-        # Create read-only sharing permission
-        new_share = DocumentShare(
-            document_id=document.id,
-            shared_with_user_id=recipient.id,
-            permission="view"
+        result = create_share(
+            document,
+            recipient,
+            current_user,
+            db
         )
-
-        db.add(new_share)
-        db.flush()
-
-        # Record sharing activity
-        audit = AuditLog(
-            user_id=current_user.id,
-            document_id=document.id,
-            action="DOCUMENT_SHARED",
-            details={
-                "recipient_email": recipient.email,
-                "permission": "view"
-            }
-        )
-
-        db.add(audit)
-        db.commit()
-        db.refresh(new_share)
 
         return {
             "message": "Document shared successfully",
             "document_id": document.id,
             "recipient_email": recipient.email,
-            "permission": new_share.permission,
-            "share_id": new_share.id
+            "permission": "view",
+            "share_id": result["id"]
         }
 
     except Exception:
@@ -332,34 +582,8 @@ def share_document(
         raise
 
 
-# LIST DOCUMENTS SHARED WITH ME
-@router.get(
-    "/shared-with-me",
-    response_model=list[DocumentResponse]
-)
-def get_shared_documents(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-
-    documents = db.query(Document).join(
-        DocumentShare,
-        DocumentShare.document_id == Document.id
-    ).filter(
-        DocumentShare.shared_with_user_id == current_user.id,
-        DocumentShare.permission == "view"
-    ).order_by(
-        DocumentShare.shared_at.desc()
-    ).all()
-
-    return documents
-
-
 # VIEW DOCUMENT DETAILS
-@router.get(
-    "/{document_id}",
-    response_model=DocumentResponse
-)
+@router.get("/{document_id}")
 def get_document(
     document_id: int,
     db: Session = Depends(get_db),
@@ -372,20 +596,16 @@ def get_document(
         db
     )
 
-    # Record document viewing activity
-    audit = AuditLog(
+    db.add(AuditLog(
         user_id=current_user.id,
         document_id=document.id,
         action="DOCUMENT_VIEWED",
-        details={
-            "filename": document.title
-        }
-    )
+        details={"filename": document.title}
+    ))
 
-    db.add(audit)
     db.commit()
 
-    return document
+    return get_document_response(document, db)
 
 
 # DOWNLOAD DOCUMENT
@@ -413,17 +633,13 @@ def download_document(
             detail="Document file not found"
         )
 
-    # Record download activity
-    audit = AuditLog(
+    db.add(AuditLog(
         user_id=current_user.id,
         document_id=document.id,
         action="DOCUMENT_DOWNLOADED",
-        details={
-            "filename": document.title
-        }
-    )
+        details={"filename": document.title}
+    ))
 
-    db.add(audit)
     db.commit()
 
     return FileResponse(
@@ -431,3 +647,55 @@ def download_document(
         filename=document.title,
         media_type="application/octet-stream"
     )
+
+
+# DELETE DOCUMENT
+@router.delete("/{document_id}")
+def delete_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+
+    document = db.query(Document).filter(
+        Document.id == document_id,
+        Document.owner_id == current_user.id
+    ).first()
+
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found or you are not the owner"
+        )
+
+    file_path = Path(document.file_path)
+
+    # Preserve previous audit history while removing its document FK.
+    db.query(AuditLog).filter(
+        AuditLog.document_id == document.id
+    ).update(
+        {AuditLog.document_id: None},
+        synchronize_session=False
+    )
+
+    db.query(DocumentShare).filter(
+        DocumentShare.document_id == document.id
+    ).delete(synchronize_session=False)
+
+    db.add(AuditLog(
+        user_id=current_user.id,
+        document_id=None,
+        action="DOCUMENT_DELETED",
+        details={"filename": document.title}
+    ))
+
+    db.delete(document)
+    db.commit()
+
+    if file_path.is_file():
+        try:
+            file_path.unlink()
+        except OSError:
+            pass
+
+    return {"message": "Document deleted successfully"}
